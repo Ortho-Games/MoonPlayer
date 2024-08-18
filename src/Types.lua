@@ -65,10 +65,18 @@ export type MoonItem = {
 		[any]: true,
 	},
 
+	Animation: Animation?,
+	Markers: { [number]: { { Name: string, Value: any? } } }?,
+
 	Props: {
 		[string]: MoonProperty,
 	},
 
+	Path: MoonAnimPath,
+}
+
+export type MoonCamRef = {
+	Target: BasePart?,
 	Path: MoonAnimPath,
 }
 
@@ -89,6 +97,7 @@ export type MoonAnimInfo = {
 	Length: number,
 	FPS: number,
 	Looped: boolean,
+	CamRef: MoonAnimPath?,
 }
 
 export type MoonAnimSave = {

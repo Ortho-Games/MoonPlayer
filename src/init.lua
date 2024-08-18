@@ -1,10 +1,12 @@
 local HttpService = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 
-local Janitor = require(script.Packages.Janitor)
-local Signal = require(script.Packages.Signal)
+local Janitor = require(script.Parent.Packages.Janitor)
+local Signal = require(script.Parent.Packages.Signal)
 
 local EaseFuncs = require(script.EaseFuncs)
+local OrthoUtil = require(script.Parent.OrthoUtil)
 local Specials = require(script.Specials)
 local Types = require(script.Types)
 
@@ -27,6 +29,7 @@ type Scratchpad = Types.Scratchpad
 type MoonItem = Types.MoonItem
 type MoonAnimInfo = Types.MoonAnimInfo
 type MoonAnimItem = Types.MoonAnimItem
+type MoonCamRef = Types.MoonCamRef
 type MoonAnimPath = Types.MoonAnimPath
 type MoonAnimSave = Types.MoonAnimSave
 type MoonEaseInfo = Types.MoonEaseInfo
@@ -44,12 +47,17 @@ export type MoonTrack = typeof(setmetatable(
 		Completed: Signal,
 		Looped: boolean,
 		Playing: boolean,
+		Length: number,
 		_janitor: Janitor,
 		_items: { MoonItem },
 		_targets: { [Instance]: MoonItem },
 		_save: StringValue,
 		_data: MoonAnimSave,
-		_time: number,
+		_startTime: number,
+		_savedTime: number,
+		_markerSignals: { [string]: Signal },
+		_markers: { [number]: { { Name: string, Value: any } } },
+		_camRef: MoonCamRef,
 	},
 	MoonTrack
 ))
@@ -104,7 +112,7 @@ local function setPropValue(
 				-- sets the default value to true here, which
 				-- would behave as an immediate dispatch.
 				-- Not the behavior we need.
-				warn("idk what this is, but if anyone sees this let @RoboGojo know")
+				warn("Unexplained remnants of Moonlite. If anyone sees this let RoboGojo know.")
 				value = false
 			end
 
@@ -346,9 +354,27 @@ local function MakeItem(moonItem: MoonAnimItem, itemSave: Instance, root: Instan
 			Locks = {},
 			Props = {},
 			Animation = animationsMemo[moonItem.ID or ""],
+			Markers = {},
 			Target = target,
 			Path = moonItem.Path,
 		}
+
+		assert(item.Markers)
+
+		local markerTrack = itemSave:FindFirstChild("MarkerTrack")
+		if markerTrack then
+			for _, KF in markerTrack:GetChildren() do
+				local frameNumber = tonumber(KF.Name)
+				if not frameNumber then continue end
+				for _, MF in KF.KFMarkers:GetChildren() do
+					table.insert(item.Markers, {
+						Frame = frameNumber,
+						Name = MF.Value,
+						Value = MF.Val.Value,
+					})
+				end
+			end
+		end
 	else
 		local props = {}
 		for _, prop in itemSave:GetChildren() do
@@ -370,7 +396,32 @@ local function MakeItem(moonItem: MoonAnimItem, itemSave: Instance, root: Instan
 	return item
 end
 
-function MoonTrack.new(save: StringValue, root: Instance?): MoonTrack
+local function MakeMarkerSignal(self: MoonTrack, item: MoonItem, markerName: string)
+	assert(item.Markers)
+
+	for _, markerData in item.Markers do
+		if markerData.Name ~= markerName then continue end
+		local markerDatum = self._markers[markerData.Frame]
+		if not markerDatum then
+			markerDatum = {}
+			self._markers[markerData.Frame] = markerDatum
+		end
+		table.insert(markerDatum, markerData)
+	end
+
+	self._markerSignals[markerName] = Signal.new()
+	return self._markerSignals[markerName]
+end
+
+local function CheckMarkerSignal(self: MoonTrack, frame: number)
+	local markerDatum = self._markers[frame]
+	if not markerDatum then return end
+	for _, markerData in ipairs(markerDatum) do
+		self._markerSignals[markerData.Name]:Fire(markerData.Value)
+	end
+end
+
+function MoonTrack.new(save: StringValue, root: Instance?, camRefOriginCF: CFrame?): MoonTrack
 	local data: MoonAnimSave = HttpService:JSONDecode(save.Value)
 	local janitor = Janitor.new()
 
@@ -386,10 +437,22 @@ function MoonTrack.new(save: StringValue, root: Instance?): MoonTrack
 		_items = {},
 		_save = save,
 		_data = data,
-		_time = 0,
 		_scratch = {},
 		_targets = {},
+		_startTime = 0,
+		_savedTime = 0,
+		_markerSignals = {},
+		_markers = {},
+		_camRef = data.Information.CamRef and {
+			Target = resolveAnimPath(data.Information.CamRef, root),
+			Path = data.Information.CamRef,
+			OriginCF = camRefOriginCF,
+		},
 	}, MoonTrack)
+
+	if self._camRef and not camRefOriginCF then
+		warn("Must specify the camera origin, or else the camera animation may be off.")
+	end
 
 	for i, moonItem in data.Items do
 		local itemSave = assert(save:FindFirstChild(i))
@@ -397,9 +460,9 @@ function MoonTrack.new(save: StringValue, root: Instance?): MoonTrack
 		table.insert(self._items, item)
 		if item.Target then
 			if item.Path.ItemType == "Rig" then
-				local target = item.Target
-					:FindFirstChildWhichIsA("Animator", true)
-					:LoadAnimation(item.Animation)
+				local animator = item.Target:FindFirstChildWhichIsA("Animator", true)
+				local target = animator
+					and self._janitor:Add(animator:LoadAnimation(item.Animation), "Stop")
 				self._targets[item.Target] = item
 				item.Target = target
 			else
@@ -413,18 +476,27 @@ end
 
 function MoonTrack.Destroy(self: MoonTrack)
 	if not self._janitor.Destroy then return end
-	self:Reset()
 	self._janitor:Destroy()
 end
 
 function MoonTrack.Play(self: MoonTrack)
 	self:Reset()
+	self:Resume()
+end
 
-	local startTime = os.clock()
+function MoonTrack.Resume(self: MoonTrack)
+	self._startTime = os.clock() - self._savedTime
+
+	local lastFrame = self._savedTime * self._data.Information.FPS // 1
 	local conn = RunService.RenderStepped:Connect(function()
-		local t = os.clock() - startTime
+		local t = os.clock() - self._startTime
 		local frameTime = t * self._data.Information.FPS
 		local frame = frameTime // 1
+
+		for i = lastFrame + 1, frame do
+			CheckMarkerSignal(self, i)
+		end
+		lastFrame = frame
 
 		local completed = frame > self._data.Information.Length
 		if completed and self._data.Information.Looped then
@@ -442,9 +514,10 @@ function MoonTrack.Play(self: MoonTrack)
 				if not target.IsPlaying then
 					target:Play()
 					target:AdjustSpeed(0)
-					self._playingJanitor:Add(target, "Stop")
+					self._janitor:Add(target, "Stop")
 				end
 				target.TimePosition = t
+
 				continue
 			end
 
@@ -457,40 +530,50 @@ function MoonTrack.Play(self: MoonTrack)
 					kf = prop.Sequence[prop._currentFrame]
 				end
 
+				local v
 				if kf then
-					local v = kf.Handler(math.clamp((frameTime - kf.Time) / kf.Duration, 0, 1))
-					setPropValue(self._scratch, item.Target, propName, v)
+					v = kf.Handler(math.clamp((frameTime - kf.Time) / kf.Duration, 0, 1))
 				else
-					setPropValue(
-						self._scratch,
-						item.Target,
-						propName,
-						prop.Sequence[prop._currentFrame - 1].Value
-					)
+					v = prop.Sequence[prop._currentFrame - 1].Value
 					prop._currentFrame = nil
 				end
+
+				if
+					item.Path.ItemType == "Camera"
+					and propName == "CFrame"
+					and self._camRef
+					and self._camRef.Target
+				then
+					v = self._camRef.Target.CFrame * self._camRef.OriginCF:Inverse() * v
+				end
+
+				setPropValue(self._scratch, item.Target, propName, v)
 			end
 		end
 
 		if completed then
-			if not self._data.Information.Looped then self:Stop() end
+			if not self._data.Information.Looped then self:Pause() end
 			self.Completed:Fire()
 		end
 	end)
-	self._playingJanitor:Add(conn, "Disconnect")
 
 	self.Playing = true
 	self._playingJanitor:Add(function()
+		conn:Disconnect()
 		self.Playing = false
 	end, true)
 end
 
-function MoonTrack.Stop(self: MoonTrack)
+function MoonTrack.Pause(self: MoonTrack)
 	if not self._playingJanitor.Cleanup then return end
 	self._playingJanitor:Cleanup()
+	self._savedTime = os.clock() - self._startTime
 end
 
 function MoonTrack.Reset(self: MoonTrack)
+	self._startTime = os.clock()
+	self._savedTime = 0
+
 	for _, item in self._items do
 		if not item.Target then continue end
 
@@ -498,7 +581,17 @@ function MoonTrack.Reset(self: MoonTrack)
 			item.Target.TimePosition = 0
 		else
 			for propName: string, prop in item.Props do
-				setPropValue(self._scratch, item.Target, propName, prop.Default, true)
+				local default = prop.Default
+				if
+					item.Path.ItemType == "Camera"
+					and propName == "CFrame"
+					and self._camRef
+					and self._camRef.Target
+				then
+					default = self._camRef.Target.CFrame * self._camRef.OriginCF:Inverse() * default
+				end
+
+				setPropValue(self._scratch, item.Target, propName, default, true)
 				prop._currentFrame = if prop.Sequence[1] then 1 else nil
 			end
 		end
@@ -534,16 +627,36 @@ function MoonTrack.UnlockItem(self: MoonTrack, target: Instance?, lock: any?)
 	return false
 end
 
-function MoonTrack.ReplaceItemByPath(self: MoonTrack, targetPath: string, replacement: Instance)
+function MoonTrack.ReplaceCameraRefByPath(
+	self: MoonTrack,
+	targetPath: string,
+	replacement: Instance
+): boolean
+	if
+		self._camRef
+		and toPath(self._camRef.Path):lower() == targetPath:lower()
+		and replacement:IsA(self._camRef.Path.ItemType)
+	then
+		self._camRef.Target = replacement :: BasePart
+		return true
+	else
+		return false
+	end
+end
+
+function MoonTrack.ReplaceItemByPath(
+	self: MoonTrack,
+	targetPath: string,
+	replacement: Instance
+): boolean
 	for _, item in self._items do
 		if toPath(item.Path):lower() ~= targetPath:lower() then continue end
 		local itemType = item.Path.ItemType
 
 		if itemType == "Rig" then
-			local target = replacement:FindFirstChildWhichIsA("Animator", true)
-			if target then
-				target = target:LoadAnimation(item.Animation)
-				item.Target = target
+			local animator = replacement:FindFirstChildWhichIsA("Animator", true)
+			if animator then
+				item.Target = self._janitor:Add(animator:LoadAnimation(item.Animation), "Stop")
 				self._targets[replacement] = item
 				return true
 			end
@@ -556,9 +669,33 @@ function MoonTrack.ReplaceItemByPath(self: MoonTrack, targetPath: string, replac
 		end
 	end
 
-	warn("!! PATH REPLACE FAILED:", targetPath)
-
 	return false
+end
+
+local function getRig(self: MoonTrack, targetPath: string)
+	for _, item in self._items do
+		if toPath(item.Path):lower() ~= targetPath:lower() then continue end
+		local itemType = item.Path.ItemType
+		if itemType == "Rig" then return item end
+	end
+
+	return nil
+end
+
+function MoonTrack.GetRigTrack(self: MoonTrack, targetPath: string): AnimationTrack?
+	local item = getRig(self, targetPath)
+	return item and item.Target
+end
+
+function MoonTrack.GetRigTracks(self: MoonTrack)
+	return OrthoUtil.filter_map(self._items, function(item)
+		return if item.Path.ItemType == "Rig" then item.Target else nil
+	end)
+end
+
+function MoonTrack.GetMarkerReachedSignal(self: MoonTrack, targetPath: string, markerName: string)
+	local item = getRig(self, targetPath)
+	return item and MakeMarkerSignal(self, item, markerName)
 end
 
 function MoonTrack.GetSetting<T>(self: MoonTrack, name: string): T
